@@ -12,7 +12,7 @@ from scenarios import SITUATIONS, DIFFICULTIES, PSYCHOTYPES, LPR
 MODEL = "GigaChat-2"
 BASE_URL = "https://api.giga.chat/v1"
 
-KNOWLEDGE_PATH = st.secrets.get("KNOWLEDGE_PATH", "knowledge")
+KNOWLEDGE_PATH = st.secrets.get("KNOWLEDGE_PATH", ".")
 MAX_KNOWLEDGE_CHARS = 15000
 
 # Минимальная длина имени/телефона для «авторизации»
