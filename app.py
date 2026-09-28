@@ -17,12 +17,27 @@ MAX_KNOWLEDGE_CHARS = 15000
 MIN_NAME_LEN = 2
 MIN_PHONE_LEN = 5
 
+# Файлы, которые не подмешиваем в базу знаний (служебные)
+EXCLUDE_MD_NAMES = {
+    "readme.md",
+    "changelog.md",
+    "license.md",
+    "license.txt",
+    "contributing.md",
+    "code_of_conduct.md",
+    "authors.md",
+    "notice.md",
+    "security.md",
+    "pull_request_template.md",
+}
+
 
 def _resolve_knowledge_path() -> str:
     """Надёжно определяет путь к базе знаний.
 
-    - Безопасно читает secrets (не падает, если файла нет или версия старая).
-    - Относительный путь резолвит от папки, где лежит этот файл.
+    - Если в secrets задан KNOWLEDGE_PATH — используем его.
+    - Иначе берём папку, где лежит этот файл (рядом с app.py).
+    - Относительный путь резолвится от папки app.py, не от cwd.
     """
     raw = None
     try:
@@ -30,14 +45,20 @@ def _resolve_knowledge_path() -> str:
     except Exception:
         raw = None
 
-    path = raw or "knowledge"
-
-    if not os.path.isabs(path):
+    if raw:
+        path = raw
+        if not os.path.isabs(path):
+            try:
+                base_dir = os.path.dirname(os.path.abspath(__file__))
+            except NameError:
+                base_dir = os.getcwd()
+            path = os.path.join(base_dir, path)
+    else:
+        # По умолчанию — папка, где лежит app.py
         try:
-            base_dir = os.path.dirname(os.path.abspath(__file__))
+            path = os.path.dirname(os.path.abspath(__file__))
         except NameError:
-            base_dir = os.getcwd()
-        path = os.path.join(base_dir, path)
+            path = os.getcwd()
 
     return os.path.normpath(path)
 
@@ -133,16 +154,19 @@ def load_knowledge_base(folder_path: str) -> dict:
     texts = []
     for root, _dirs, files in os.walk(folder_path):
         for file in files:
-            if file.lower().endswith(".md"):
-                path = os.path.join(root, file)
-                rel = os.path.relpath(path, folder_path)
-                try:
-                    with open(path, "r", encoding="utf-8") as f:
-                        texts.append(f"\n\n--- {rel} ---\n\n{f.read()}")
-                    result["files"] += 1
-                    result["file_list"].append(rel)
-                except Exception as e:
-                    texts.append(f"\n\n--- Ошибка чтения {rel}: {e} ---\n\n")
+            if not file.lower().endswith(".md"):
+                continue
+            if file.lower() in EXCLUDE_MD_NAMES:
+                continue
+            path = os.path.join(root, file)
+            rel = os.path.relpath(path, folder_path)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    texts.append(f"\n\n--- {rel} ---\n\n{f.read()}")
+                result["files"] += 1
+                result["file_list"].append(rel)
+            except Exception as e:
+                texts.append(f"\n\n--- Ошибка чтения {rel}: {e} ---\n\n")
 
     result["text"] = "\n".join(texts)
     result["ok"] = result["files"] > 0
