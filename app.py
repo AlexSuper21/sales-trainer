@@ -1,9 +1,10 @@
+import os
+import csv
+from datetime import datetime
+
 import streamlit as st
 from gigachat import GigaChat
 from gigachat.models import ChatCompletionRequest, ChatMessage
-import csv
-import os
-from datetime import datetime
 
 from scenarios import SITUATIONS, DIFFICULTIES, PSYCHOTYPES, LPR
 
@@ -12,12 +13,37 @@ from scenarios import SITUATIONS, DIFFICULTIES, PSYCHOTYPES, LPR
 MODEL = "GigaChat-2"
 BASE_URL = "https://api.giga.chat/v1"
 
-KNOWLEDGE_PATH = st.secrets.get("KNOWLEDGE_PATH", "knowledge")
 MAX_KNOWLEDGE_CHARS = 15000
-
-# Минимальная длина имени/телефона для «авторизации»
 MIN_NAME_LEN = 2
 MIN_PHONE_LEN = 5
+
+
+def _resolve_knowledge_path() -> str:
+    """Надёжно определяет путь к базе знаний.
+
+    - Безопасно читает secrets (не падает, если файла нет или версия старая).
+    - Относительный путь резолвит от папки, где лежит этот файл.
+    """
+    raw = None
+    try:
+        raw = st.secrets.get("KNOWLEDGE_PATH", None)
+    except Exception:
+        raw = None
+
+    path = raw or "knowledge"
+
+    if not os.path.isabs(path):
+        try:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+        except NameError:
+            base_dir = os.getcwd()
+        path = os.path.join(base_dir, path)
+
+    return os.path.normpath(path)
+
+
+KNOWLEDGE_PATH = _resolve_knowledge_path()
+
 
 # Список недопустимых слов (нижний регистр, проверка по подстроке)
 BAD_WORDS = [
@@ -88,26 +114,42 @@ def contains_bad_words(text: str) -> bool:
 # === ЗАГРУЗКА БАЗЫ ЗНАНИЙ ===
 @st.cache_data(show_spinner=False)
 def load_knowledge_base(folder_path: str) -> dict:
-    result = {"text": "", "files": 0, "ok": False, "message": ""}
+    result = {
+        "text": "",
+        "files": 0,
+        "ok": False,
+        "message": "",
+        "abs_path": os.path.abspath(folder_path),
+        "file_list": [],
+    }
+
     if not os.path.isdir(folder_path):
-        result["message"] = f"Папка не найдена: {folder_path}"
+        result["message"] = (
+            f"Папка не найдена: {result['abs_path']} "
+            f"(cwd: {os.getcwd()})"
+        )
         return result
+
     texts = []
-    for root, dirs, files in os.walk(folder_path):
+    for root, _dirs, files in os.walk(folder_path):
         for file in files:
-            if file.endswith(".md"):
+            if file.lower().endswith(".md"):
                 path = os.path.join(root, file)
+                rel = os.path.relpath(path, folder_path)
                 try:
                     with open(path, "r", encoding="utf-8") as f:
-                        texts.append(f"\n\n--- {file} ---\n\n{f.read()}")
-                        result["files"] += 1
+                        texts.append(f"\n\n--- {rel} ---\n\n{f.read()}")
+                    result["files"] += 1
+                    result["file_list"].append(rel)
                 except Exception as e:
-                    texts.append(f"\n\n--- Ошибка чтения {file}: {e} ---\n\n")
+                    texts.append(f"\n\n--- Ошибка чтения {rel}: {e} ---\n\n")
+
     result["text"] = "\n".join(texts)
     result["ok"] = result["files"] > 0
     result["message"] = (
-        f"Загружено файлов: {result['files']}" if result["ok"]
-        else "В папке не найдено .md-файлов"
+        f"Загружено файлов: {result['files']}"
+        if result["ok"]
+        else f"В папке {result['abs_path']} не найдено .md-файлов"
     )
     return result
 
@@ -269,7 +311,7 @@ def save_kb_log(question: str, answer: str) -> None:
         ])
 
 
-# === ИНДИКАТОР БАЗЫ ===
+# === ИНДИКАТОР И ДИАГНОСТИКА БАЗЫ ===
 def render_status_indicator(kb: dict) -> None:
     color = "#22c55e" if kb["ok"] else "#ef4444"
     label = (
@@ -289,6 +331,25 @@ def render_status_indicator(kb: dict) -> None:
         """,
         unsafe_allow_html=True,
     )
+
+
+def render_kb_diagnostics(kb: dict, reload_key: str) -> None:
+    """Раскрывающийся блок с диагностикой базы знаний."""
+    with st.expander("🔧 Диагностика базы знаний", expanded=not kb["ok"]):
+        st.code(f"KNOWLEDGE_PATH = {KNOWLEDGE_PATH}", language="text")
+        st.code(f"Абсолютный путь = {kb['abs_path']}", language="text")
+        st.code(f"Текущая директория = {os.getcwd()}", language="text")
+
+        if kb["file_list"]:
+            st.write("Найденные .md-файлы:")
+            for name in kb["file_list"]:
+                st.write(f"• {name}")
+        else:
+            st.write("Ни одного .md-файла не найдено.")
+
+        if st.button("♻️ Перезагрузить базу", key=reload_key):
+            st.cache_data.clear()
+            st.rerun()
 
 
 # === АВТОРИЗАЦИЯ ===
@@ -324,8 +385,8 @@ def render_kb_mode() -> None:
 
     kb = load_knowledge_base(KNOWLEDGE_PATH)
     render_status_indicator(kb)
+    render_kb_diagnostics(kb, reload_key="reload_kb_chat")
 
-    # Инициализация истории
     if "kb_messages" not in st.session_state:
         st.session_state.kb_messages = []
 
@@ -335,7 +396,7 @@ def render_kb_mode() -> None:
             st.session_state.kb_messages = []
             st.rerun()
 
-    # История
+    # История диалога
     for msg in st.session_state.kb_messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
@@ -350,7 +411,7 @@ def render_kb_mode() -> None:
         ]
         cols = st.columns(len(examples))
         for c, ex in zip(cols, examples):
-            if c.button(ex, use_container_width=True):
+            if c.button(ex, use_container_width=True, key=f"kb_ex_{ex[:10]}"):
                 st.session_state.kb_pending = ex
                 st.rerun()
 
@@ -370,7 +431,9 @@ def render_kb_mode() -> None:
                 except Exception as e:
                     answer = f"⚠️ Ошибка при обращении к модели: {e}"
                 st.markdown(answer)
-        st.session_state.kb_messages.append({"role": "assistant", "content": answer})
+        st.session_state.kb_messages.append(
+            {"role": "assistant", "content": answer}
+        )
 
         try:
             save_kb_log(question, answer)
@@ -384,6 +447,7 @@ def render_trainer_mode() -> None:
 
     kb = load_knowledge_base(KNOWLEDGE_PATH)
     render_status_indicator(kb)
+    render_kb_diagnostics(kb, reload_key="reload_kb_trainer")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -413,7 +477,6 @@ def render_trainer_mode() -> None:
             st.write(prompt)
 
         if contains_bad_words(prompt):
-            # Не добавляем сообщение в историю — клиент реагирует предупреждением
             with st.chat_message("assistant"):
                 st.write(BLOCK_MESSAGE)
             st.session_state.messages.append(
@@ -458,7 +521,6 @@ def render_trainer_mode() -> None:
 
 # === ИНТЕРФЕЙС ===
 def render_ui() -> None:
-    # Сайдбар с данными пользователя и выбором режима
     with st.sidebar:
         st.markdown(f"**👤 {st.session_state.user['name']}**")
         st.caption(f"📞 {st.session_state.user['phone']}")
