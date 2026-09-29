@@ -164,7 +164,7 @@ def inject_css() -> None:
         .stApp {{ background: var(--bg); color: var(--fg); }}
         .block-container {{
             padding-top: 2rem !important;
-            padding-bottom: 7rem !important;
+            padding-bottom: 8rem !important;
             max-width: 1100px;
         }}
         h1, h2, h3, h4 {{ color: var(--fg); letter-spacing: -0.01em; }}
@@ -255,35 +255,53 @@ def inject_css() -> None:
         .eval-ok  {{ background: rgba(234,179,8,0.15); color: #eab308; }}
         .eval-top {{ background: rgba(34,197,94,0.15); color: #22c55e; }}
 
-        /* Фикс chat_input — прибит к низу окна */
-        div[data-testid="stChatInput"] {{
+        /* Поле ввода — прибито к низу и растянуто по ширине чата */
+        div[data-testid="stChatInput"],
+        section[data-testid="stChatInput"],
+        div.stChatInput {{
             position: fixed !important;
             bottom: 0 !important;
             left: 0 !important;
             right: 0 !important;
+            width: 100% !important;
+            max-width: 100% !important;
+            margin: 0 !important;
             background: var(--bg) !important;
-            padding: 12px 2rem 16px 2rem !important;
             border-top: 1px solid var(--border) !important;
-            z-index: 100 !important;
-            max-width: 1100px;
-            margin: 0 auto;
+            padding: 12px 2rem 16px 2rem !important;
+            z-index: 9999 !important;
+            box-sizing: border-box !important;
         }}
-        div[data-testid="stChatInput"] > div {{
-            max-width: 1100px;
-            margin: 0 auto;
+        /* Внутренняя обёртка — центрируем по ширине чата */
+        div[data-testid="stChatInput"] > div,
+        section[data-testid="stChatInput"] > div,
+        div.stChatInput > div {{
+            width: 100% !important;
+            max-width: 1100px !important;
+            margin: 0 auto !important;
+            box-sizing: border-box !important;
+        }}
+        /* Textarea на всю ширину обёртки */
+        div[data-testid="stChatInput"] textarea,
+        section[data-testid="stChatInput"] textarea,
+        div.stChatInput textarea {{
+            width: 100% !important;
+            max-width: 100% !important;
         }}
 
         @media (max-width: 640px) {{
             .block-container {{
                 padding-left: 0.75rem !important;
                 padding-right: 0.75rem !important;
-                padding-bottom: 6rem !important;
+                padding-bottom: 7rem !important;
             }}
             h1 {{ font-size: 1.4rem !important; }}
             .stChatInput textarea {{ font-size: 16px !important; }}
             .stage-bar {{ flex-wrap: wrap; }}
             .stage-bar .goal {{ margin-left: 0; width: 100%; }}
-            div[data-testid="stChatInput"] {{
+            div[data-testid="stChatInput"],
+            section[data-testid="stChatInput"],
+            div.stChatInput {{
                 padding-left: 0.75rem !important;
                 padding-right: 0.75rem !important;
             }}
@@ -368,8 +386,6 @@ def ask_client(messages: list) -> str:
 
 
 # === ПАРСИНГ ===
-
-# Кириллические «двойники» латинских букв — для нормализации ключей
 _CYR_TO_LAT = str.maketrans({
     'А': 'A', 'В': 'B', 'Е': 'E', 'К': 'K', 'М': 'M', 'Н': 'H',
     'О': 'O', 'Р': 'P', 'С': 'C', 'Т': 'T', 'У': 'Y', 'Х': 'X',
@@ -382,16 +398,12 @@ _KNOWN_KEYS = {
     "EVAL", "COMMENT", "QUESTION",
 }
 
-# Любое слово из 2–20 букв (латиница + кириллица) с двоеточием —
-# потенциальный ключ. Отбираем потом по нормализованному имени.
 _CANDIDATE_KEY_RE = re.compile(
     r'(?<![\w])([A-Za-zА-Яа-яЁё_]{2,20})\s*:\s*'
 )
 
-# Скобочные осколки вида [THOUGHT], [/SPEECH]
 _TAG_RE = re.compile(r'\[\s*/?\s*[A-ZА-ЯЁ_]{3,}\s*\]')
 
-# Одиночные ключи-метки, которые могли не отфильтроваться
 _STRAY_KEY_RE = re.compile(
     r'(?<![\w])(THOUGHT|SPEECH|SPEЧ|SPECH|STAGE[_\s]?DONE|'
     r'KB|NOTE|EVAL|COMMENT|QUESTION)\s*:\s*',
@@ -400,7 +412,6 @@ _STRAY_KEY_RE = re.compile(
 
 
 def _normalize_key(raw: str) -> str:
-    """Приводит ключ к каноническому виду. Чинит кириллицу и опечатки."""
     key = raw.strip().upper().replace(" ", "_")
     key = key.translate(_CYR_TO_LAT)
     key = key.replace("Ч", "CH")
@@ -416,15 +427,12 @@ def _normalize_key(raw: str) -> str:
 
 
 def _clean_tag_remnants(text: str) -> str:
-    """Убирает любые осколки тегов и ключей."""
     text = _TAG_RE.sub('', text)
     text = _STRAY_KEY_RE.sub('', text)
     return text.strip()
 
 
 def _parse_blocks(text: str) -> dict:
-    """Парсит блоки 'KEY: value'. Ключ ищется в любом месте текста,
-    включая случаи с кириллическими подменами (SPEЧ → SPEECH)."""
     result = {}
     matches = []
     for m in _CANDIDATE_KEY_RE.finditer(text):
@@ -453,13 +461,11 @@ def _is_none_value(val) -> bool:
 
 
 def parse_thought_speech(text: str):
-    """Возвращает (thought, speech, stage_done)."""
     blocks = _parse_blocks(text)
     if any(k in blocks for k in ("SPEECH", "THOUGHT", "STAGE_DONE")):
         thought = blocks.get("THOUGHT")
         if _is_none_value(thought):
             thought = None
-        # Защита: если в thought просочился кусок речи, обрезаем
         if thought:
             cut = re.split(
                 r'\bSPE[EЕ]*CH?\b|\bSPE[EЕ]*C\b',
@@ -509,7 +515,7 @@ def parse_eval(text: str):
 
 # === ПРОМПТЫ ===
 def build_trainer_prompt(situation, difficulty, psychotype, lpr, stage, lead) -> str:
-    knowledge = get_knowledge_text()
+    """Промпт клиента-тренажёра. БЕЗ базы знаний — клиент не эксперт."""
     lead_str = "\n".join(f"- {k}: {v}" for k, v in lead.items() if v)
 
     return f"""Ты играешь роль КЛИЕНТА в тренажёре по продажам загородных домов.
@@ -519,8 +525,18 @@ def build_trainer_prompt(situation, difficulty, psychotype, lpr, stage, lead) ->
 {situation['context']}
 Твоя цель: {situation['goal']}
 
-ЗАЯВКА КЛИЕНТА (твои данные):
+ТВОИ ДАННЫЕ (ЗАЯВКА) — ЭТО ИСТИНА В ПОСЛЕДНЕЙ ИНСТАНЦИИ:
 {lead_str}
+
+ЖЁСТКОЕ ПРАВИЛО ПРО ЗАЯВКУ:
+- Всё, что указано в заявке выше, — это твои реальные данные.
+- НИКОГДА не противоречь им. Если в заявке «Участок: Есть» —
+  у тебя ЕСТЬ участок. Если «Участок: Нет» — участка нет.
+- Если менеджер спрашивает про эти данные — отвечай в соответствии
+  с заявкой.
+- Ты можешь добавлять уточнения (где участок, какой именно), но
+  они должны быть согласованы с заявкой, а не противоречить ей.
+- Если менеджер ошибётся в этих данных — можешь мягко поправить.
 
 УРОВЕНЬ СЛОЖНОСТИ:
 {difficulty['prompt']}
@@ -535,8 +551,14 @@ def build_trainer_prompt(situation, difficulty, psychotype, lpr, stage, lead) ->
 Цель менеджера: {stage['goal']}
 Правила этапа: {stage['rules']}
 
-БАЗА ЗНАНИЙ О ПРОДУКТЕ КОМПАНИИ:
-{knowledge}
+ВАЖНО ПРО ЗНАНИЯ ПРОДУКТА:
+- Ты — КЛИЕНТ, а не сотрудник компании. Ты НЕ знаешь внутренних
+  деталей: как компания делает топосъёмку, как оформляет документы
+  через МФЦ, какие у неё регламенты и т.д.
+- Если менеджер упоминает такие детали — реагируй как обычный
+  заказчик: «интересно», «а это обязательно?», «а сколько это
+  стоит?» — но не рассуждай как эксперт.
+- Всё, что ты знаешь о продукте — это то, что написано в заявке.
 
 ФОРМАТ ОТВЕТА — три блока. Каждый блок начинается С НОВОЙ СТРОКИ
 со своей метки. Метка пишется ЛАТИНСКИМИ буквами, двоеточие обязательно.
@@ -828,11 +850,7 @@ def render_stage_bar(stage_index: int) -> None:
 
 
 def render_assistant_message(content: str) -> None:
-    """Рендер реплики клиента с мыслью/жестом."""
     thought, speech, _ = parse_thought_speech(content)
-
-    # Дополнительный предохранитель: если в speech остались осколки
-    # меток — вычистим их и в нём
     speech = _clean_tag_remnants(speech) or speech
 
     if thought:
@@ -1071,7 +1089,6 @@ def render_trainer_chat() -> None:
     with st.expander("🔍 Посмотреть текущий промпт клиента"):
         st.text(st.session_state.messages[0]["content"])
 
-    # Кнопки управления — выше истории
     col1, col2 = st.columns(2)
     with col1:
         eval_clicked = st.button(
@@ -1111,7 +1128,6 @@ def render_trainer_chat() -> None:
             except Exception as e:
                 st.error(f"Не удалось оценить: {e}")
 
-    # История
     for msg in st.session_state.messages[1:]:
         with st.chat_message(msg["role"]):
             if msg["role"] == "assistant":
@@ -1119,7 +1135,6 @@ def render_trainer_chat() -> None:
             else:
                 st.write(msg["content"])
 
-    # Ввод — всегда последний
     prompt = st.chat_input("Ваш ответ клиенту...", key="trainer_input")
     if prompt:
         if contains_bad_words(prompt):
