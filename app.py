@@ -1,12 +1,22 @@
 import os
 import csv
-from datetime import datetime
+import re
+import json
+from datetime import datetime, timedelta
 
 import streamlit as st
 from gigachat import GigaChat
 from gigachat.models import ChatCompletionRequest, ChatMessage
 
 from scenarios import SITUATIONS, DIFFICULTIES, PSYCHOTYPES, LPR
+
+
+# === ОПЦИОНАЛЬНЫЕ ЗАВИСИМОСТИ ===
+try:
+    import extra_streamlit_components as stx
+    COOKIE_AVAILABLE = True
+except ImportError:
+    COOKIE_AVAILABLE = False
 
 
 # === НАСТРОЙКИ ===
@@ -17,28 +27,110 @@ MAX_KNOWLEDGE_CHARS = 15000
 MIN_NAME_LEN = 2
 MIN_PHONE_LEN = 5
 
-# Файлы, которые не подмешиваем в базу знаний (служебные)
+COOKIE_NAME = "sales_trainer_user"
+COOKIE_DAYS = 30
+
 EXCLUDE_MD_NAMES = {
-    "readme.md",
-    "changelog.md",
-    "license.md",
-    "license.txt",
-    "contributing.md",
-    "code_of_conduct.md",
-    "authors.md",
-    "notice.md",
-    "security.md",
-    "pull_request_template.md",
+    "readme.md", "changelog.md", "license.md", "license.txt",
+    "contributing.md", "code_of_conduct.md", "authors.md",
+    "notice.md", "security.md", "pull_request_template.md",
 }
 
 
-def _resolve_knowledge_path() -> str:
-    """Надёжно определяет путь к базе знаний.
+# === ВОРОНКА ПРОДАЖ ===
+STAGES = [
+    {
+        "id": "new_lead",
+        "title": "Новая заявка",
+        "goal": "Связаться с клиентом, познакомиться, разговорить, "
+                "узнать базовые потребности.",
+        "rules": "Не давить, не продавать в лоб. Цель — установить контакт "
+                 "и понять, что человеку нужно.",
+    },
+    {
+        "id": "ndz",
+        "title": "НДЗ",
+        "goal": "Клиент долго не отвечал, но наконец взял трубку / ответил. "
+                "Разговорить и провести квалификацию.",
+        "rules": "Не упрекать за молчание. Мягко выяснить контекст, "
+                 "задать квалифицирующие вопросы.",
+    },
+    {
+        "id": "in_work",
+        "title": "Взято в работу",
+        "goal": "Дозвонились, но квалификацию не провели. Провести "
+                "квалификацию и вывести на встречу (офис / объект / участок / ВКС).",
+        "rules": "Не перескакивать к презентации продукта, пока нет ответов "
+                 "на ключевые вопросы.",
+    },
+    {
+        "id": "qualification",
+        "title": "Квалификация",
+        "goal": "Получить ответы на 4 вопроса: когда строить, бюджет, "
+                "есть ли участок, технология. Вывести на встречу для "
+                "проработки планировки / фасада / посадки.",
+        "rules": "Не продавать дом на этом этапе. Только собрать информацию "
+                 "и договориться о встрече.",
+    },
+    {
+        "id": "meeting",
+        "title": "Встреча проведена",
+        "goal": "Выбрать типовой проект, начать проектирование или принять "
+                "проект клиента. Согласовать детали и перейти к смете.",
+        "rules": "Не спорить о цене на этом этапе. Задача — согласовать проект.",
+    },
+    {
+        "id": "project",
+        "title": "Проект выбран",
+        "goal": "Согласовать все детали проекта, рассчитать смету, "
+                "пригласить клиента на встречу для согласования.",
+        "rules": "Не давить с ценой. Сначала — проект, потом — смета.",
+    },
+    {
+        "id": "estimate",
+        "title": "Смета и проект согласованы",
+        "goal": "Цена утверждена. Получить реквизиты клиента и "
+                "договориться о дате подписания договора подряда.",
+        "rules": "Не менять условия постфактум. Задача — довести до подписания.",
+    },
+    {
+        "id": "contract",
+        "title": "Договор подписан",
+        "goal": "Получить оплату, отправить счёт, передать в ПФР.",
+        "rules": "Работа с постпродажной поддержкой. Тон — партнёрский.",
+    },
+]
 
-    - Если в secrets задан KNOWLEDGE_PATH — используем его.
-    - Иначе берём папку, где лежит этот файл (рядом с app.py).
-    - Относительный путь резолвится от папки app.py, не от cwd.
-    """
+STAGE_INDEX_BY_ID = {s["id"]: i for i, s in enumerate(STAGES)}
+
+
+# Список недопустимых слов (нижний регистр, проверка по подстроке)
+BAD_WORDS = [
+    "хуй", "хуя", "хую", "хуем", "хуе", "хуё", "хуйн", "хуёв", "хуев",
+    "пизд", "пизж",
+    "бляд", "блять", "блядь",
+    "ебат", "ебал", "ебет", "ебут", "ебан", "ёбан", "ебуч", "ебля",
+    "ебись", "еби", "ёбат", "ёбал", "ёбет", "ёбут",
+    "нахуй", "нахуя", "похуй", "похуя", "охуе",
+    "залуп", "манда", "манду", "манде",
+    "сука", "суки", "сучк",
+    "мудак", "мудил",
+    "пидор", "пидар", "пидр",
+    "гандон", "гондон",
+    "долбоеб", "долбоёб",
+    "шлюх", "ублюд",
+    "fuck", "shit", "bitch", "cunt", "dick", "pussy",
+    "asshole", "motherfucker",
+]
+
+BLOCK_MESSAGE = (
+    "⛔ Контент 18+ не допустим для менеджера. "
+    "Вернитесь к предыдущему сообщению."
+)
+
+
+# === ПУТЬ К БАЗЕ ЗНАНИЙ ===
+def _resolve_knowledge_path() -> str:
     raw = None
     try:
         raw = st.secrets.get("KNOWLEDGE_PATH", None)
@@ -54,7 +146,6 @@ def _resolve_knowledge_path() -> str:
                 base_dir = os.getcwd()
             path = os.path.join(base_dir, path)
     else:
-        # По умолчанию — папка, где лежит app.py
         try:
             path = os.path.dirname(os.path.abspath(__file__))
         except NameError:
@@ -66,60 +157,158 @@ def _resolve_knowledge_path() -> str:
 KNOWLEDGE_PATH = _resolve_knowledge_path()
 
 
-# Список недопустимых слов (нижний регистр, проверка по подстроке)
-BAD_WORDS = [
-    # Русский мат
-    "хуй", "хуя", "хую", "хуем", "хуе", "хуё", "хуйн", "хуёв", "хуев",
-    "пизд", "пизж",
-    "бляд", "блять", "блядь",
-    "ебат", "ебал", "ебет", "ебут", "ебан", "ёбан", "ебуч", "ебля",
-    "ебись", "еби", "ёбат", "ёбал", "ёбет", "ёбут",
-    "нахуй", "нахуя", "похуй", "похуя", "охуе",
-    "залуп", "манда", "манду", "манде",
-    # Ругательства
-    "сука", "суки", "сучк",
-    "мудак", "мудил",
-    "пидор", "пидар", "пидр",
-    "гандон", "гондон",
-    "долбоеб", "долбоёб",
-    "шлюх", "ублюд",
-    # Английские
-    "fuck", "shit", "bitch", "cunt", "dick", "pussy",
-    "asshole", "motherfucker",
-]
-
-BLOCK_MESSAGE = (
-    "⛔ Контент 18+ не допустим для менеджера. "
-    "Вернитесь к предыдущему сообщению."
-)
-
-
-# === MOBILE CSS ===
+# === ТЕМА И СТИЛИ ===
 def inject_css() -> None:
+    theme = st.session_state.get("theme", "dark")
+    if theme == "dark":
+        bg = "#0f1116"
+        fg = "#e7e9ee"
+        card = "#161a22"
+        border = "#232a36"
+        accent = "#7c5cff"
+        muted = "#8b93a7"
+        thought = "#8b93a7"
+        note = "#eab308"
+    else:
+        bg = "#f7f8fb"
+        fg = "#1a1d24"
+        card = "#ffffff"
+        border = "#e3e6ee"
+        accent = "#5b46f5"
+        muted = "#6b7280"
+        thought = "#6b7280"
+        note = "#b45309"
+
     st.markdown(
-        """
+        f"""
         <style>
-        @media (max-width: 640px) {
-            .block-container {
+        :root {{
+            --bg: {bg};
+            --fg: {fg};
+            --card: {card};
+            --border: {border};
+            --accent: {accent};
+            --muted: {muted};
+            --thought: {thought};
+            --note: {note};
+        }}
+        .stApp {{
+            background: var(--bg);
+            color: var(--fg);
+        }}
+        .block-container {{
+            padding-top: 2rem !important;
+            max-width: 1100px;
+        }}
+        h1, h2, h3, h4 {{
+            color: var(--fg);
+            letter-spacing: -0.01em;
+        }}
+        .stTabs [data-baseweb="tab-list"] {{
+            gap: 4px;
+            border-bottom: 1px solid var(--border);
+        }}
+        .stTabs [data-baseweb="tab"] {{
+            height: 44px;
+            padding: 0 18px;
+            background: transparent;
+            border-radius: 10px 10px 0 0;
+            color: var(--muted);
+            font-weight: 500;
+        }}
+        .stTabs [aria-selected="true"] {{
+            background: var(--card) !important;
+            color: var(--fg) !important;
+            border: 1px solid var(--border);
+            border-bottom: 1px solid var(--card) !important;
+        }}
+        .stButton > button {{
+            border-radius: 10px;
+            border: 1px solid var(--border);
+            background: var(--card);
+            color: var(--fg);
+            transition: all 0.15s ease;
+        }}
+        .stButton > button:hover {{
+            border-color: var(--accent);
+            color: var(--accent);
+        }}
+        .stChatMessage {{
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            background: var(--card);
+        }}
+        .thought {{
+            color: var(--thought);
+            font-style: italic;
+            font-size: 0.9rem;
+            margin-bottom: 4px;
+            opacity: 0.85;
+        }}
+        .note {{
+            color: var(--note);
+            font-style: italic;
+            font-size: 0.95rem;
+            margin-top: 8px;
+            padding-left: 10px;
+            border-left: 3px solid var(--note);
+        }}
+        .stage-bar {{
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px 14px;
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            background: var(--card);
+            margin-bottom: 12px;
+        }}
+        .stage-bar .num {{
+            font-weight: 700;
+            color: var(--accent);
+        }}
+        .stage-bar .title {{
+            font-weight: 600;
+            color: var(--fg);
+        }}
+        .stage-bar .goal {{
+            color: var(--muted);
+            font-size: 0.85rem;
+            margin-left: auto;
+        }}
+        .progress-wrap {{
+            height: 6px;
+            background: var(--border);
+            border-radius: 3px;
+            overflow: hidden;
+            margin-bottom: 14px;
+        }}
+        .progress-fill {{
+            height: 100%;
+            background: linear-gradient(90deg, var(--accent), #b388ff);
+            transition: width 0.3s ease;
+        }}
+        .badge-eval {{
+            display: inline-block;
+            padding: 2px 10px;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            margin-bottom: 6px;
+        }}
+        .eval-bad {{ background: rgba(239,68,68,0.15); color: #ef4444; }}
+        .eval-ok  {{ background: rgba(234,179,8,0.15); color: #eab308; }}
+        .eval-top {{ background: rgba(34,197,94,0.15); color: #22c55e; }}
+        @media (max-width: 640px) {{
+            .block-container {{
                 padding-left: 0.75rem !important;
                 padding-right: 0.75rem !important;
-                padding-top: 1rem !important;
-            }
-            h1 {
-                font-size: 1.4rem !important;
-            }
-            .stChatInput textarea {
-                font-size: 16px !important;
-            }
-            .stSelectbox label, .stTextInput label {
-                font-size: 14px !important;
-            }
-            div[data-testid="column"] {
-                width: 100% !important;
-                flex: 1 1 100% !important;
-                min-width: 100% !important;
-            }
-        }
+            }}
+            h1 {{ font-size: 1.4rem !important; }}
+            .stChatInput textarea {{ font-size: 16px !important; }}
+            .stage-bar {{ flex-wrap: wrap; }}
+            .stage-bar .goal {{ margin-left: 0; width: 100%; }}
+        }}
         </style>
         """,
         unsafe_allow_html=True,
@@ -136,18 +325,12 @@ def contains_bad_words(text: str) -> bool:
 @st.cache_data(show_spinner=False)
 def load_knowledge_base(folder_path: str) -> dict:
     result = {
-        "text": "",
-        "files": 0,
-        "ok": False,
-        "message": "",
-        "abs_path": os.path.abspath(folder_path),
-        "file_list": [],
+        "text": "", "files": 0, "ok": False, "message": "",
+        "abs_path": os.path.abspath(folder_path), "file_list": [],
     }
-
     if not os.path.isdir(folder_path):
         result["message"] = (
-            f"Папка не найдена: {result['abs_path']} "
-            f"(cwd: {os.getcwd()})"
+            f"Папка не найдена: {result['abs_path']} (cwd: {os.getcwd()})"
         )
         return result
 
@@ -171,15 +354,13 @@ def load_knowledge_base(folder_path: str) -> dict:
     result["text"] = "\n".join(texts)
     result["ok"] = result["files"] > 0
     result["message"] = (
-        f"Загружено файлов: {result['files']}"
-        if result["ok"]
+        f"Загружено файлов: {result['files']}" if result["ok"]
         else f"В папке {result['abs_path']} не найдено .md-файлов"
     )
     return result
 
 
 def get_knowledge_text() -> str:
-    """Возвращает обрезанный под лимит текст базы знаний."""
     kb = load_knowledge_base(KNOWLEDGE_PATH)
     knowledge = kb["text"]
     if len(knowledge) > MAX_KNOWLEDGE_CHARS:
@@ -187,7 +368,7 @@ def get_knowledge_text() -> str:
     return knowledge
 
 
-# === РАБОТА С GIGACHAT ===
+# === GIGACHAT ===
 def get_client() -> GigaChat:
     return GigaChat(
         credentials=st.secrets["GIGACHAT_KEY"],
@@ -208,11 +389,203 @@ def ask_client(messages: list) -> str:
         return response.messages[0].content[0].text
 
 
-def evaluate_dialog(messages: list, scenario_title: str) -> str:
+# === ПАРСИНГ ОТВЕТОВ ===
+THOUGHT_RE = re.compile(r"\[THOUGHT\](.*?)\[/THOUGHT\]", re.DOTALL | re.IGNORECASE)
+SPEECH_RE = re.compile(r"\[SPEECH\](.*?)\[/SPEECH\]", re.DOTALL | re.IGNORECASE)
+STAGE_DONE_RE = re.compile(r"\[STAGE_DONE\](.*?)\[/STAGE_DONE\]", re.DOTALL | re.IGNORECASE)
+KB_RE = re.compile(r"\[KB\](.*?)\[/KB\]", re.DOTALL | re.IGNORECASE)
+NOTE_RE = re.compile(r"\[NOTE\](.*?)\[/NOTE\]", re.DOTALL | re.IGNORECASE)
+EVAL_RE = re.compile(r"\[EVAL\](.*?)\[/EVAL\]", re.DOTALL | re.IGNORECASE)
+
+
+def parse_thought_speech(text: str):
+    """Возвращает (thought, speech, stage_done)."""
+    stage_done = None
+    m = STAGE_DONE_RE.search(text)
+    if m:
+        stage_done = m.group(1).strip()
+        text = STAGE_DONE_RE.sub("", text)
+
+    thought = None
+    m = THOUGHT_RE.search(text)
+    if m:
+        thought = m.group(1).strip()
+        text = THOUGHT_RE.sub("", text)
+
+    m = SPEECH_RE.search(text)
+    if m:
+        speech = m.group(1).strip()
+    else:
+        speech = text.strip()
+
+    return thought, speech, stage_done
+
+
+def parse_kb_note(text: str):
+    kb_text = None
+    m = KB_RE.search(text)
+    if m:
+        kb_text = m.group(1).strip()
+        text = KB_RE.sub("", text)
+    note = None
+    m = NOTE_RE.search(text)
+    if m:
+        note = m.group(1).strip()
+        text = NOTE_RE.sub("", text)
+    if kb_text is None:
+        kb_text = text.strip()
+    return kb_text, note
+
+
+def parse_eval(text: str):
+    m = EVAL_RE.search(text)
+    if m:
+        return m.group(1).strip().lower(), EVAL_RE.sub("", text).strip()
+    return None, text.strip()
+
+
+# === ПРОМПТЫ ===
+def build_trainer_prompt(situation, difficulty, psychotype, lpr, stage, lead) -> str:
+    knowledge = get_knowledge_text()
+    lead_str = "\n".join(f"- {k}: {v}" for k, v in lead.items() if v)
+
+    return f"""Ты играешь роль КЛИЕНТА в тренажёре по продажам загородных домов.
+Менеджер (пользователь) учится вести сделку по воронке продаж.
+
+СИТУАЦИЯ:
+{situation['context']}
+Твоя цель: {situation['goal']}
+
+ЗАЯВКА КЛИЕНТА (твои данные):
+{lead_str}
+
+УРОВЕНЬ СЛОЖНОСТИ:
+{difficulty['prompt']}
+
+ПСИХОТИП:
+{psychotype['prompt']}
+
+РОЛЬ В СДЕЛКЕ:
+{lpr['prompt']}
+
+ТЕКУЩИЙ ЭТАП ВОРОНКИ: {stage['title']}
+Цель менеджера на этом этапе: {stage['goal']}
+Правила этапа: {stage['rules']}
+
+БАЗА ЗНАНИЙ О ПРОДУКТЕ КОМПАНИИ:
+{knowledge}
+
+ФОРМАТ ОТВЕТА:
+- Отвечай кратко, как в мессенджере (1–3 предложения).
+- Если внутри тебя происходит что-то важное (сомнение, раздражение,
+  интерес, удивление) — добавь в начале:
+  [THOUGHT]короткая мысль или жест[/THOUGHT]
+  Если ничего значимого — тег не добавляй.
+- Реплику оборачивай в [SPEECH]...[/SPEECH] (или просто пиши без тега).
+
+ПЕРЕХОД ЭТАПА:
+- Когда менеджер выполнил цель текущего этапа — добавь тег
+  [STAGE_DONE]короткое объяснение, что цель достигнута[/STAGE_DONE]
+  в начале ответа. После этого продолжай диалог уже как клиент
+  следующего этапа воронки.
+
+ВАЖНО:
+- Не выходи из роли. Ты — клиент, а не ассистент.
+- Задавай вопросы, сомневайся, торгуйся — в зависимости от психотипа.
+- Если менеджер давит или грубит — реагируй по своему психотипу.
+- Если менеджер пишет что-то неприличное — не поддерживай тему."""
+
+
+def build_kb_prompt() -> str:
+    knowledge = get_knowledge_text()
+    return f"""Ты — внутренний ассистент-эксперт по продукту компании
+(загородные дома). Отвечай на вопросы сотрудников, опираясь на базу знаний.
+
+БАЗА ЗНАНИЙ:
+{knowledge}
+
+ФОРМАТ ОТВЕТА:
+[KB]
+ответ, основанный ТОЛЬКО на базе знаний (структурированно: списки,
+короткие абзацы, при необходимости ссылка на .md-файл)
+[/KB]
+[NOTE]
+если по твоим данным информация устарела или могла измениться —
+осторожный комментарий: «возможно, изменилось», «рекомендую проверить».
+Если сомнений нет — тег NOTE не добавляй.
+[/NOTE]
+
+ПРАВИЛА:
+- Если ответа в базе нет — в блоке KB напиши: «В базе знаний нет
+  информации по этому вопросу».
+- Не выдумывай факты, цены, сроки, характеристики.
+- Тон — деловой, дружелюбный, без «воды»."""
+
+
+def build_objection_prompt(situation, difficulty, psychotype, lpr, history_text) -> str:
+    return f"""Ты — клиент в тренажёре по работе с возражениями.
+
+КОНТЕКСТ:
+Ситуация: {situation['title']}
+Сложность: {difficulty['title']}
+Психотип: {psychotype['title']}
+Роль в сделке: {lpr['title']}
+
+{situation['context']}
+
+ИСТОРИЯ ДИАЛОГА:
+{history_text}
+
+ЗАДАЧА:
+Сгенерируй ОДНО реалистичное возражение клиента, соответствующее
+психотипу и сложности. Верни только текст возражения без пояснений."""
+
+
+def build_objection_eval_prompt() -> str:
+    return """Ты — руководитель отдела продаж. Оцени ответ менеджера
+на возражение клиента.
+
+Критерии:
+- плохо — не отработал, ушёл от темы, давит, спорит
+- хорошо — ответил по делу, но без углубления
+- превосходно — снял напряжение, привёл аргумент, повёл к следующему шагу
+
+Верни ответ строго в формате:
+[EVAL]плохо[/EVAL] или [EVAL]хорошо[/EVAL] или [EVAL]превосходно[/EVAL]
+Короткий комментарий (1–2 предложения): что было хорошо / что улучшить.
+
+Если возражение НЕ закрыто — задай один уточняющий вопрос клиенту
+в конце (как продолжение диалога)."""
+
+
+def build_advisor_prompt(knowledge) -> str:
+    return f"""Ты — наставник менеджера по продажам загородных домов.
+Тебе передают рабочие комментарии менеджера из CRM (Битрикс24).
+
+Твоя задача:
+1. Определить, на каком этапе воронки находится клиент (по тексту).
+2. Дать совет: что делать дальше, чтобы продвинуть клиента
+   к следующему этапу или к подписанию договора.
+3. Опираться на базу знаний компании, если это релевантно.
+
+ЭТАПЫ ВОРОНКИ:
+{chr(10).join(f'- {s["title"]}: {s["goal"]}' for s in STAGES)}
+
+БАЗА ЗНАНИЙ:
+{knowledge}
+
+ПРАВИЛА:
+- Формат — свободный текст.
+- Тон — деловой, конкретный, без «воды».
+- Если данных мало — честно скажи, чего не хватает.
+- Если пользователь задаёт уточняющие вопросы — отвечай по существу."""
+
+
+def build_eval_prompt(messages: list, scenario_title: str) -> str:
     dialog_text = "\n".join(
         f"{m['role']}: {m['content']}" for m in messages[1:]
     )
-    eval_prompt = f"""Ты — руководитель отдела продаж. Оцени менеджера по 5 критериям от 1 до 10:
+    return f"""Ты — руководитель отдела продаж. Оцени менеджера по 5 критериям от 1 до 10:
 1. Выявление потребностей
 2. Презентация ценности
 3. Отработка возражений
@@ -230,112 +603,115 @@ def evaluate_dialog(messages: list, scenario_title: str) -> str:
 Закрытие: X/10
 Тон: X/10
 Общий комментарий: ..."""
-    request = ChatCompletionRequest(
-        messages=[ChatMessage(role="user", content=eval_prompt)]
-    )
-    with get_client() as client:
-        response = client.chat.create(request)
-        return response.messages[0].content[0].text
 
 
-# === СБОРКА ПРОМПТА ТРЕНАЖЁРА ===
-def build_system_prompt(situation, difficulty, psychotype, lpr) -> str:
-    knowledge = get_knowledge_text()
-
-    return f"""Ты играешь роль клиента в тренажёре по продажам загородных домов.
-
-СИТУАЦИЯ:
-{situation['context']}
-Твоя цель: {situation['goal']}
-
-УРОВЕНЬ СЛОЖНОСТИ:
-{difficulty['prompt']}
-
-ПСИХОТИП:
-{psychotype['prompt']}
-
-РОЛЬ В СДЕЛКЕ:
-{lpr['prompt']}
-
-БАЗА ЗНАНИЙ О ПРОДУКТЕ КОМПАНИИ:
-{knowledge}
-
-ВАЖНО:
-- Не выходи из роли. Ты — клиент, а не ассистент.
-- Отвечай кратко, как в мессенджере (1–3 предложения).
-- Задавай вопросы, сомневайся, торгуйся — в зависимости от уровня и психотипа.
-- Если менеджер давит или грубит — реагируй в соответствии со своим психотипом.
-- Если менеджер пишет что-то неприличное — не поддерживай тему."""
+# === ЛОГИ ===
+def _append_csv(path: str, header: list, row: list) -> None:
+    exists = os.path.isfile(path)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if not exists:
+            w.writerow(header)
+        w.writerow(row)
 
 
-# === СБОРКА ПРОМПТА РЕЖИМА "БАЗА ЗНАНИЙ" ===
-def build_kb_system_prompt() -> str:
-    knowledge = get_knowledge_text()
-    return f"""Ты — внутренний ассистент-эксперт по продукту компании
-(загородные дома). Твоя задача — отвечать на вопросы сотрудников,
-опираясь ИСКЛЮЧИТЕЛЬНО на базу знаний ниже.
-
-БАЗА ЗНАНИЙ:
-{knowledge}
-
-ПРАВИЛА:
-- Отвечай по существу, структурированно (списки, короткие абзацы).
-- Если ответа в базе нет — честно скажи: «В базе знаний нет информации
-  по этому вопросу» и предложи уточнить у руководителя.
-- Не выдумывай факты, цены, сроки и характеристики, которых нет в базе.
-- При необходимости цитируй источник (имя .md-файла в блоке «--- файл ---»).
-- Тон — деловой, дружелюбный, без «воды».
-"""
-
-
-def ask_kb(question: str, history: list) -> str:
-    messages = [{"role": "system", "content": build_kb_system_prompt()}]
-    messages.extend(history)
-    messages.append({"role": "user", "content": question})
-    return ask_client(messages)
-
-
-# === СОХРАНЕНИЕ ЛОГОВ ===
-def save_log(meta: dict, messages: list, evaluation: str) -> None:
-    log_file = "logs.csv"
-    file_exists = os.path.isfile(log_file)
-    with open(log_file, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        if not file_exists:
-            writer.writerow([
-                "datetime", "user_name", "user_phone",
-                "situation", "difficulty", "psychotype", "lpr",
-                "dialog", "evaluation",
-            ])
-        writer.writerow([
+def save_trainer_log(meta: dict, messages: list, evaluation: str) -> None:
+    _append_csv(
+        "logs.csv",
+        ["datetime", "user_name", "user_phone", "situation", "difficulty",
+         "psychotype", "lpr", "stage", "dialog", "evaluation"],
+        [
             datetime.now(),
             st.session_state.user["name"],
             st.session_state.user["phone"],
             meta["situation"], meta["difficulty"],
-            meta["psychotype"], meta["lpr"],
+            meta["psychotype"], meta["lpr"], meta["stage"],
             str(messages[1:]), evaluation,
-        ])
+        ],
+    )
 
 
 def save_kb_log(question: str, answer: str) -> None:
-    log_file = "kb_logs.csv"
-    file_exists = os.path.isfile(log_file)
-    with open(log_file, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        if not file_exists:
-            writer.writerow([
-                "datetime", "user_name", "user_phone",
-                "question", "answer",
-            ])
-        writer.writerow([
+    _append_csv(
+        "kb_logs.csv",
+        ["datetime", "user_name", "user_phone", "question", "answer"],
+        [
             datetime.now(),
             st.session_state.user["name"],
             st.session_state.user["phone"],
             question, answer,
-        ])
+        ],
+    )
 
 
-# === ИНДИКАТОР И ДИАГНОСТИКА БАЗЫ ===
+def save_advisor_log(question: str, answer: str) -> None:
+    _append_csv(
+        "advisor_logs.csv",
+        ["datetime", "user_name", "user_phone", "question", "answer"],
+        [
+            datetime.now(),
+            st.session_state.user["name"],
+            st.session_state.user["phone"],
+            question, answer,
+        ],
+    )
+
+
+# === COOKIE ===
+def get_cookie_manager():
+    if not COOKIE_AVAILABLE:
+        return None
+    return stx.CookieManager(key="cookie_mgr")
+
+
+def restore_session_from_cookie() -> None:
+    if "user" in st.session_state:
+        return
+    cm = get_cookie_manager()
+    if cm is None:
+        return
+    try:
+        raw = cm.get(COOKIE_NAME)
+    except Exception:
+        raw = None
+    if not raw:
+        return
+    try:
+        data = json.loads(raw)
+        if data.get("name") and data.get("phone"):
+            st.session_state.user = {
+                "name": data["name"],
+                "phone": data["phone"],
+            }
+    except Exception:
+        pass
+
+
+def save_session_cookie(user: dict) -> None:
+    cm = get_cookie_manager()
+    if cm is None:
+        return
+    try:
+        cm.set(
+            COOKIE_NAME,
+            json.dumps(user),
+            expires_at=datetime.now() + timedelta(days=COOKIE_DAYS),
+        )
+    except Exception:
+        pass
+
+
+def clear_session_cookie() -> None:
+    cm = get_cookie_manager()
+    if cm is None:
+        return
+    try:
+        cm.delete(COOKIE_NAME)
+    except Exception:
+        pass
+
+
+# === UI-ХЕЛПЕРЫ ===
 def render_status_indicator(kb: dict) -> None:
     color = "#22c55e" if kb["ok"] else "#ef4444"
     label = (
@@ -358,22 +734,49 @@ def render_status_indicator(kb: dict) -> None:
 
 
 def render_kb_diagnostics(kb: dict, reload_key: str) -> None:
-    """Раскрывающийся блок с диагностикой базы знаний."""
     with st.expander("🔧 Диагностика базы знаний", expanded=not kb["ok"]):
         st.code(f"KNOWLEDGE_PATH = {KNOWLEDGE_PATH}", language="text")
         st.code(f"Абсолютный путь = {kb['abs_path']}", language="text")
         st.code(f"Текущая директория = {os.getcwd()}", language="text")
-
         if kb["file_list"]:
             st.write("Найденные .md-файлы:")
             for name in kb["file_list"]:
                 st.write(f"• {name}")
         else:
             st.write("Ни одного .md-файла не найдено.")
-
         if st.button("♻️ Перезагрузить базу", key=reload_key):
             st.cache_data.clear()
             st.rerun()
+
+
+def render_stage_bar(stage_index: int) -> None:
+    stage = STAGES[stage_index]
+    total = len(STAGES)
+    pct = int(((stage_index + 1) / total) * 100)
+    st.markdown(
+        f"""
+        <div class="stage-bar">
+            <span class="num">{stage_index + 1}/{total}</span>
+            <span class="title">{stage['title']}</span>
+            <span class="goal">{stage['goal']}</span>
+        </div>
+        <div class="progress-wrap">
+            <div class="progress-fill" style="width:{pct}%"></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_assistant_message(content: str) -> None:
+    """Рендер реплики клиента с мыслью/жестом."""
+    thought, speech, _ = parse_thought_speech(content)
+    if thought:
+        st.markdown(
+            f'<div class="thought">💭 {thought}</div>',
+            unsafe_allow_html=True,
+        )
+    st.markdown(speech)
 
 
 # === АВТОРИЗАЦИЯ ===
@@ -395,79 +798,103 @@ def render_login() -> None:
             elif len(phone_clean) < MIN_PHONE_LEN:
                 st.error("Введите корректный номер телефона.")
             else:
-                st.session_state.user = {
-                    "name": name_clean,
-                    "phone": phone_clean,
-                }
+                user = {"name": name_clean, "phone": phone_clean}
+                st.session_state.user = user
+                save_session_cookie(user)
                 st.rerun()
 
 
-# === ЭКРАН "БАЗА ЗНАНИЙ" ===
-def render_kb_mode() -> None:
-    st.title("📚 База знаний")
-    st.caption("Задайте вопрос — ответ будет построен по загруженной базе.")
+# === САЙДБАР ===
+def render_sidebar() -> None:
+    with st.sidebar:
+        st.markdown(f"**👤 {st.session_state.user['name']}**")
+        st.caption(f"📞 {st.session_state.user['phone']}")
+        st.divider()
 
-    kb = load_knowledge_base(KNOWLEDGE_PATH)
-    render_status_indicator(kb)
-    render_kb_diagnostics(kb, reload_key="reload_kb_chat")
-
-    if "kb_messages" not in st.session_state:
-        st.session_state.kb_messages = []
-
-    col_a, col_b = st.columns([3, 1])
-    with col_b:
-        if st.button("🔄 Очистить чат", use_container_width=True):
-            st.session_state.kb_messages = []
+        theme = st.radio(
+            "Тема",
+            ["dark", "light"],
+            format_func=lambda x: "🌙 Тёмная" if x == "dark" else "☀️ Светлая",
+            index=0 if st.session_state.get("theme", "dark") == "dark" else 1,
+            key="theme_radio",
+        )
+        if theme != st.session_state.get("theme"):
+            st.session_state.theme = theme
             st.rerun()
 
-    # История диалога
-    for msg in st.session_state.kb_messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-
-    # Примеры быстрых вопросов
-    if not st.session_state.kb_messages:
-        st.markdown("**Примеры вопросов:**")
-        examples = [
-            "Какие типовые комплектации домов есть?",
-            "Какие сроки строительства?",
-            "Что входит в базовую стоимость?",
-        ]
-        cols = st.columns(len(examples))
-        for c, ex in zip(cols, examples):
-            if c.button(ex, use_container_width=True, key=f"kb_ex_{ex[:10]}"):
-                st.session_state.kb_pending = ex
-                st.rerun()
-
-    # Ввод
-    pending = st.session_state.pop("kb_pending", None)
-    question = st.chat_input("Ваш вопрос по базе знаний...") or pending
-
-    if question:
-        with st.chat_message("user"):
-            st.markdown(question)
-        st.session_state.kb_messages.append({"role": "user", "content": question})
-
-        with st.chat_message("assistant"):
-            with st.spinner("Ищу в базе знаний..."):
-                try:
-                    answer = ask_kb(question, st.session_state.kb_messages[:-1])
-                except Exception as e:
-                    answer = f"⚠️ Ошибка при обращении к модели: {e}"
-                st.markdown(answer)
-        st.session_state.kb_messages.append(
-            {"role": "assistant", "content": answer}
-        )
-
-        try:
-            save_kb_log(question, answer)
-        except Exception:
-            pass
+        st.divider()
+        if st.button("Выйти", use_container_width=True):
+            clear_session_cookie()
+            for k in ["user", "messages", "config_key", "stage_index",
+                      "trainer_started", "lead", "kb_messages",
+                      "objection_messages", "advisor_messages"]:
+                st.session_state.pop(k, None)
+            st.rerun()
 
 
-# === ЭКРАН "ТРЕНАЖЁР" ===
-def render_trainer_mode() -> None:
-    st.title("🎭 AI-тренажёр для отдела продаж")
+# === НАСТРОЙКА ТРЕНАЖЁРА ===
+LEAD_FIELD_ORDER = [
+    ("source", "Источник заявки"),
+    ("area", "Метраж дома"),
+    ("floors", "Этажность"),
+    ("bedrooms", "Спален"),
+    ("package", "Комплектация"),
+    ("payment", "Форма оплаты"),
+    ("timeline", "Срок строительства"),
+    ("land", "Участок"),
+    ("show", "Показ объектов"),
+    ("estimate_channel", "Куда направить смету"),
+    ("name", "Имя клиента"),
+    ("phone", "Телефон клиента"),
+]
+
+
+def default_lead(situation, psychotype) -> dict:
+    return {
+        "source": "Заявка с сайта",
+        "area": "100–120 м²",
+        "floors": "Двухэтажный",
+        "bedrooms": "4",
+        "package": "Тёплый контур",
+        "payment": "Ипотека",
+        "timeline": "Через 6 месяцев",
+        "land": "Есть",
+        "show": "Да, хочет посмотреть построенный дом",
+        "estimate_channel": "Max",
+        "name": situation.get("client_name", "Клиент"),
+        "phone": "+7 999 999 99 99",
+    }
+
+
+def generate_lead_with_ai(situation, difficulty, psychotype, lpr) -> dict:
+    prompt = f"""Сгенерируй реалистичную заявку на строительство загородного дома.
+
+Параметры:
+- Ситуация: {situation['title']}
+- Сложность: {difficulty['title']}
+- Психотип: {psychotype['title']}
+- Роль в сделке: {lpr['title']}
+
+Верни СТРОГО JSON без пояснений с полями:
+source, area, floors, bedrooms, package, payment, timeline, land, show,
+estimate_channel, name, phone
+Значения — короткие строки на русском."""
+    try:
+        raw = ask_client([{"role": "user", "content": prompt}])
+        raw = raw.strip()
+        raw = re.sub(r"^```(json)?|```$", "", raw, flags=re.MULTILINE).strip()
+        data = json.loads(raw)
+        result = default_lead(situation, psychotype)
+        for k, _ in LEAD_FIELD_ORDER:
+            if k in data and data[k]:
+                result[k] = str(data[k])
+        return result
+    except Exception:
+        return default_lead(situation, psychotype)
+
+
+def render_trainer_setup() -> None:
+    st.subheader("⚙️ Настройка тренировки")
 
     kb = load_knowledge_base(KNOWLEDGE_PATH)
     render_status_indicator(kb)
@@ -481,21 +908,90 @@ def render_trainer_mode() -> None:
         diff = st.selectbox("Сложность", DIFFICULTIES, format_func=lambda x: x["title"])
         lpr = st.selectbox("ЛПР", LPR, format_func=lambda x: x["title"])
 
-    config_key = (sit["id"], diff["id"], psych["id"], lpr["id"])
-    if st.session_state.get("config_key") != config_key:
-        st.session_state.config_key = config_key
+    stage_options = [s["title"] for s in STAGES]
+    default_stage = st.session_state.get("stage_index", 0)
+    stage_choice = st.selectbox(
+        "Этап воронки",
+        options=list(range(len(STAGES))),
+        format_func=lambda i: f"{i + 1}. {STAGES[i]['title']}",
+        index=default_stage,
+    )
+
+    st.markdown("### 📋 Заявка клиента")
+    st.caption("Заполняется автоматически, можно скорректировать под клиента.")
+
+    if "lead" not in st.session_state:
+        st.session_state.lead = default_lead(sit, psych)
+
+    lead = st.session_state.lead
+
+    col_a, col_b = st.columns([1, 1])
+    with col_a:
+        if st.button("🎲 Сгенерировать через ИИ", use_container_width=True):
+            with st.spinner("Генерирую заявку..."):
+                st.session_state.lead = generate_lead_with_ai(sit, diff, psych, lpr)
+            st.rerun()
+    with col_b:
+        if st.button("↺ Сбросить заявку", use_container_width=True):
+            st.session_state.lead = default_lead(sit, psych)
+            st.rerun()
+
+    lead = st.session_state.lead
+    new_lead = {}
+    col1, col2 = st.columns(2)
+    for i, (key, label) in enumerate(LEAD_FIELD_ORDER):
+        target = col1 if i % 2 == 0 else col2
+        with target:
+            new_lead[key] = st.text_input(label, value=lead.get(key, ""), key=f"lead_{key}")
+    st.session_state.lead = new_lead
+
+    if st.button("🚀 Начать тренировку", type="primary", use_container_width=True):
+        st.session_state.stage_index = stage_choice
+        st.session_state.trainer_started = True
         st.session_state.messages = [
-            {"role": "system", "content": build_system_prompt(sit, diff, psych, lpr)}
+            {
+                "role": "system",
+                "content": build_trainer_prompt(
+                    sit, diff, psych, lpr,
+                    STAGES[stage_choice],
+                    st.session_state.lead,
+                ),
+            }
         ]
+        st.session_state.trainer_meta = {
+            "situation": sit["title"],
+            "difficulty": diff["title"],
+            "psychotype": psych["title"],
+            "lpr": lpr["title"],
+        }
+        st.rerun()
+
+
+# === ТРЕНАЖЁР ===
+def render_trainer_chat() -> None:
+    stage_index = st.session_state.get("stage_index", 0)
+    render_stage_bar(stage_index)
+
+    meta = st.session_state.get("trainer_meta", {})
+    with st.expander("📋 Заявка и этап"):
+        st.markdown(f"**Этап:** {STAGES[stage_index]['title']}")
+        st.markdown(f"**Цель:** {STAGES[stage_index]['goal']}")
+        st.markdown("**Заявка:**")
+        for k, label in LEAD_FIELD_ORDER:
+            val = st.session_state.lead.get(k, "")
+            if val:
+                st.markdown(f"- **{label}:** {val}")
 
     with st.expander("🔍 Посмотреть текущий промпт клиента"):
         st.text(st.session_state.messages[0]["content"])
 
     for msg in st.session_state.messages[1:]:
         with st.chat_message(msg["role"]):
-            st.write(msg["content"])
+            if msg["role"] == "assistant":
+                render_assistant_message(msg["content"])
+            else:
+                st.write(msg["content"])
 
-    # Ввод сообщения
     if prompt := st.chat_input("Ваш ответ клиенту..."):
         with st.chat_message("user"):
             st.write(prompt)
@@ -510,77 +1006,396 @@ def render_trainer_mode() -> None:
             st.session_state.messages.append({"role": "user", "content": prompt})
             with st.chat_message("assistant"):
                 with st.spinner("Клиент думает..."):
-                    answer = ask_client(st.session_state.messages)
-                    st.write(answer)
+                    try:
+                        answer = ask_client(st.session_state.messages)
+                    except Exception as e:
+                        answer = f"⚠️ Ошибка: {e}"
+                thought, speech, stage_done = parse_thought_speech(answer)
+                if thought:
+                    st.markdown(
+                        f'<div class="thought">💭 {thought}</div>',
+                        unsafe_allow_html=True,
+                    )
+                st.markdown(speech)
+                if stage_done:
+                    st.success(f"✅ {stage_done}")
+
             st.session_state.messages.append(
                 {"role": "assistant", "content": answer}
             )
 
-    if st.button("📊 Оценить диалог") and len(st.session_state.messages) > 3:
-        with st.spinner("Анализируем..."):
-            evaluation = evaluate_dialog(
-                st.session_state.messages,
-                f"{sit['title']} / {diff['title']} / {psych['title']} / {lpr['title']}",
-            )
-        st.subheader("Результат оценки")
-        st.text(evaluation)
-        save_log(
-            {
-                "situation": sit["title"],
-                "difficulty": diff["title"],
-                "psychotype": psych["title"],
-                "lpr": lpr["title"],
-            },
-            st.session_state.messages,
-            evaluation,
-        )
-        st.success("Диалог сохранён в logs.csv")
+            if stage_done:
+                new_idx = min(stage_index + 1, len(STAGES) - 1)
+                if new_idx != stage_index:
+                    st.session_state.stage_index = new_idx
+                    st.session_state.messages[0] = {
+                        "role": "system",
+                        "content": build_trainer_prompt(
+                            next(s for s in SITUATIONS if s["title"] == meta["situation"]),
+                            next(s for s in DIFFICULTIES if s["title"] == meta["difficulty"]),
+                            next(s for s in PSYCHOTYPES if s["title"] == meta["psychotype"]),
+                            next(s for s in LPR if s["title"] == meta["lpr"]),
+                            STAGES[new_idx],
+                            st.session_state.lead,
+                        ),
+                    }
+                    st.rerun()
 
-    if st.button("🔄 Начать заново"):
-        st.session_state.messages = [
-            {"role": "system", "content": build_system_prompt(sit, diff, psych, lpr)}
-        ]
-        st.rerun()
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("📊 Оценить диалог", use_container_width=True) \
+                and len(st.session_state.messages) > 3:
+            with st.spinner("Анализируем..."):
+                try:
+                    evaluation = ask_client([
+                        {"role": "user",
+                         "content": build_eval_prompt(
+                             st.session_state.messages,
+                             f"{meta.get('situation','')} / "
+                             f"{meta.get('difficulty','')} / "
+                             f"{meta.get('psychotype','')} / "
+                             f"{meta.get('lpr','')} / "
+                             f"{STAGES[stage_index]['title']}",
+                         )}
+                    ])
+                    st.subheader("Результат оценки")
+                    st.text(evaluation)
+                    save_trainer_log(
+                        {**meta, "stage": STAGES[stage_index]["title"]},
+                        st.session_state.messages,
+                        evaluation,
+                    )
+                    st.success("Диалог сохранён в logs.csv")
+                except Exception as e:
+                    st.error(f"Не удалось оценить: {e}")
 
-
-# === ИНТЕРФЕЙС ===
-def render_ui() -> None:
-    with st.sidebar:
-        st.markdown(f"**👤 {st.session_state.user['name']}**")
-        st.caption(f"📞 {st.session_state.user['phone']}")
-        st.divider()
-
-        mode = st.radio(
-            "Режим",
-            ["🎭 Тренажёр", "📚 База знаний"],
-            key="app_mode",
-        )
-
-        st.divider()
-        if st.button("Выйти"):
-            del st.session_state.user
+    with col2:
+        if st.button("🔄 Начать заново", use_container_width=True):
+            for k in ["trainer_started", "messages", "config_key", "stage_index"]:
+                st.session_state.pop(k, None)
             st.rerun()
 
-    if mode == "📚 База знаний":
-        render_kb_mode()
+
+def render_trainer_tab() -> None:
+    if not st.session_state.get("trainer_started"):
+        render_trainer_setup()
     else:
-        render_trainer_mode()
+        render_trainer_chat()
 
 
-# === ТОЧКА ВХОДА ===
+# === ВОЗРАЖЕНИЯ ===
+def render_objections_tab() -> None:
+    st.subheader("🛡️ Работа с возражениями")
+    st.caption("Возражения генерируются с учётом параметров из тренажёра.")
+
+    meta = st.session_state.get("trainer_meta")
+    if not meta:
+        st.info(
+            "Сначала настройте тренажёр — параметры (Ситуация, Сложность, "
+            "Психотип, ЛПР) подтянутся автоматически."
+        )
+        return
+
+    sit = next((s for s in SITUATIONS if s["title"] == meta["situation"]), None)
+    diff = next((s for s in DIFFICULTIES if s["title"] == meta["difficulty"]), None)
+    psych = next((s for s in PSYCHOTYPES if s["title"] == meta["psychotype"]), None)
+    lpr = next((s for s in LPR if s["title"] == meta["lpr"]), None)
+
+    if not all([sit, diff, psych, lpr]):
+        st.warning("Не удалось подтянуть параметры тренажёра.")
+        return
+
+    st.markdown(
+        f"**Параметры:** {sit['title']} · {diff['title']} · "
+        f"{psych['title']} · {lpr['title']}"
+    )
+
+    if "objection_messages" not in st.session_state:
+        st.session_state.objection_messages = []
+    if "objection_saved" not in st.session_state:
+        st.session_state.objection_saved = []
+
+    col1, col2 = st.columns([3, 1])
+    with col2:
+        if st.button("🎯 Новое возражение", use_container_width=True):
+            history_text = "\n".join(
+                f"{m['role']}: {m['content']}"
+                for m in st.session_state.objection_messages[-6:]
+            ) or "(диалог ещё не начат)"
+            with st.spinner("Генерирую..."):
+                try:
+                    prompt = build_objection_prompt(sit, diff, psych, lpr, history_text)
+                    raw = ask_client([{"role": "user", "content": prompt}])
+                    objection = raw.strip()
+                    st.session_state.objection_messages.append(
+                        {"role": "assistant", "content": objection}
+                    )
+                except Exception as e:
+                    st.error(f"Ошибка: {e}")
+            st.rerun()
+
+    with col1:
+        if st.button("🔄 Очистить", use_container_width=True):
+            st.session_state.objection_messages = []
+            st.rerun()
+
+    # Чат
+    for idx, msg in enumerate(st.session_state.objection_messages):
+        with st.chat_message(msg["role"]):
+            if msg["role"] == "assistant":
+                st.write(msg["content"])
+                if st.button(
+                    "⭐ Сохранить в избранное",
+                    key=f"save_obj_{idx}",
+                    help="Добавить это возражение в список на сессию",
+                ):
+                    text = msg["content"]
+                    if text not in [o["text"] for o in st.session_state.objection_saved]:
+                        st.session_state.objection_saved.append({"text": text})
+                        st.success("Сохранено")
+            else:
+                st.write(msg["content"])
+                eval_val = msg.get("eval")
+                if eval_val:
+                    cls = {
+                        "плохо": "eval-bad",
+                        "хорошо": "eval-ok",
+                        "превосходно": "eval-top",
+                    }.get(eval_val, "eval-ok")
+                    st.markdown(
+                        f'<span class="badge-eval {cls}">{eval_val}</span>',
+                        unsafe_allow_html=True,
+                    )
+                    if msg.get("eval_comment"):
+                        st.caption(msg["eval_comment"])
+
+    if prompt := st.chat_input("Ваш ответ на возражение..."):
+        with st.chat_message("user"):
+            st.write(prompt)
+
+        st.session_state.objection_messages.append(
+            {"role": "user", "content": prompt}
+        )
+
+        with st.chat_message("assistant"):
+            with st.spinner("Оцениваю..."):
+                try:
+                    history = "\n".join(
+                        f"{m['role']}: {m['content']}"
+                        for m in st.session_state.objection_messages
+                    )
+                    full_prompt = (
+                        build_objection_eval_prompt()
+                        + "\n\nДИАЛОГ:\n" + history
+                    )
+                    raw = ask_client([{"role": "user", "content": full_prompt}])
+                    eval_val, rest = parse_eval(raw)
+                    st.markdown(
+                        f'<span class="badge-eval '
+                        f'{"eval-bad" if eval_val == "плохо" else "eval-ok" if eval_val == "хорошо" else "eval-top"}">'
+                        f'{eval_val or "оценка"}</span>',
+                        unsafe_allow_html=True,
+                    )
+                    st.write(rest)
+
+                    # кладём оценку в последнее user-сообщение
+                    st.session_state.objection_messages[-1]["eval"] = eval_val
+                    st.session_state.objection_messages[-1]["eval_comment"] = rest
+
+                    # если модель задала уточняющий вопрос — добавляем его
+                    # в историю как assistant
+                    st.session_state.objection_messages.append(
+                        {"role": "assistant", "content": rest}
+                    )
+                except Exception as e:
+                    st.error(f"Ошибка: {e}")
+
+    if st.session_state.objection_saved:
+        with st.expander(f"⭐ Избранные возражения ({len(st.session_state.objection_saved)})"):
+            for i, o in enumerate(st.session_state.objection_saved):
+                st.markdown(f"**{i + 1}.** {o['text']}")
+
+
+# === БАЗА ЗНАНИЙ ===
+def render_kb_tab() -> None:
+    st.subheader("📚 База знаний")
+    st.caption("Ответ формируется по базе. Комментарий — знания модели.")
+
+    kb = load_knowledge_base(KNOWLEDGE_PATH)
+    render_status_indicator(kb)
+    render_kb_diagnostics(kb, reload_key="reload_kb_chat")
+
+    if "kb_messages" not in st.session_state:
+        st.session_state.kb_messages = []
+
+    col_a, col_b = st.columns([3, 1])
+    with col_b:
+        if st.button("🔄 Очистить чат", use_container_width=True, key="kb_clear"):
+            st.session_state.kb_messages = []
+            st.rerun()
+
+    for msg in st.session_state.kb_messages:
+        with st.chat_message(msg["role"]):
+            if msg["role"] == "assistant":
+                kb_text, note = parse_kb_note(msg["content"])
+                st.markdown(kb_text)
+                if note:
+                    st.markdown(
+                        f'<div class="note">💡 {note}</div>',
+                        unsafe_allow_html=True,
+                    )
+            else:
+                st.markdown(msg["content"])
+
+    if not st.session_state.kb_messages:
+        st.markdown("**Примеры вопросов:**")
+        examples = [
+            "Какие типовые комплектации домов есть?",
+            "Какие сроки строительства?",
+            "Какие условия семейной ипотеки?",
+        ]
+        cols = st.columns(len(examples))
+        for c, ex in zip(cols, examples):
+            if c.button(ex, use_container_width=True, key=f"kb_ex_{ex[:10]}"):
+                st.session_state.kb_pending = ex
+                st.rerun()
+
+    pending = st.session_state.pop("kb_pending", None)
+    question = st.chat_input("Ваш вопрос по базе знаний...") or pending
+
+    if question:
+        with st.chat_message("user"):
+            st.markdown(question)
+        st.session_state.kb_messages.append({"role": "user", "content": question})
+
+        with st.chat_message("assistant"):
+            with st.spinner("Ищу в базе знаний..."):
+                try:
+                    answer = ask_client([
+                        {"role": "system", "content": build_kb_prompt()},
+                        *st.session_state.kb_messages[:-1],
+                        {"role": "user", "content": question},
+                    ])
+                except Exception as e:
+                    answer = f"⚠️ Ошибка: {e}"
+                kb_text, note = parse_kb_note(answer)
+                st.markdown(kb_text)
+                if note:
+                    st.markdown(
+                        f'<div class="note">💡 {note}</div>',
+                        unsafe_allow_html=True,
+                    )
+        st.session_state.kb_messages.append(
+            {"role": "assistant", "content": answer}
+        )
+        try:
+            save_kb_log(question, answer)
+        except Exception:
+            pass
+
+
+# === СОВЕТНИК ===
+def render_advisor_tab() -> None:
+    st.subheader("🧭 Советник")
+    st.caption(
+        "Вставьте комментарии из Битрикс24 — ассистент определит этап "
+        "и подскажет, что делать дальше."
+    )
+
+    if "advisor_messages" not in st.session_state:
+        st.session_state.advisor_messages = []
+
+    col_a, col_b = st.columns([3, 1])
+    with col_b:
+        if st.button("🔄 Очистить чат", use_container_width=True, key="adv_clear"):
+            st.session_state.advisor_messages = []
+            st.rerun()
+
+    for msg in st.session_state.advisor_messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    if not st.session_state.advisor_messages:
+        st.markdown("**Пример запроса:**")
+        st.code(
+            "Клиент с Авито, дом 120 м², тёплый контур, ипотека. "
+            "Созвонились, участок есть, бюджет до 8 млн, планирует "
+            "строиться весной. На встречу пока не готов.",
+            language="text",
+        )
+
+    question = st.chat_input("Вставьте комментарии из CRM или задайте вопрос...")
+
+    if question:
+        with st.chat_message("user"):
+            st.markdown(question)
+        st.session_state.advisor_messages.append(
+            {"role": "user", "content": question}
+        )
+
+        with st.chat_message("assistant"):
+            with st.spinner("Анализирую..."):
+                try:
+                    knowledge = get_knowledge_text()
+                    answer = ask_client([
+                        {"role": "system", "content": build_advisor_prompt(knowledge)},
+                        *st.session_state.advisor_messages[:-1],
+                        {"role": "user", "content": question},
+                    ])
+                except Exception as e:
+                    answer = f"⚠️ Ошибка: {e}"
+                st.markdown(answer)
+        st.session_state.advisor_messages.append(
+            {"role": "assistant", "content": answer}
+        )
+        try:
+            save_advisor_log(question, answer)
+        except Exception:
+            pass
+
+
+# === ГЛАВНАЯ ===
 def main() -> None:
     st.set_page_config(
         page_title="AI-тренажёр продаж",
         page_icon="🎭",
-        layout="centered",
+        layout="wide",
+        initial_sidebar_state="expanded",
     )
+
+    if "theme" not in st.session_state:
+        st.session_state.theme = "dark"
+
     inject_css()
+    restore_session_from_cookie()
 
     if "user" not in st.session_state:
         render_login()
         return
 
-    render_ui()
+    render_sidebar()
+
+    if not COOKIE_AVAILABLE:
+        st.caption(
+            "ℹ️ Для сохранения сессии между визитами добавьте в "
+            "requirements.txt библиотеку `extra-streamlit-components`."
+        )
+
+    tab_trainer, tab_obj, tab_kb, tab_advisor = st.tabs([
+        "🎭 Тренажёр",
+        "🛡️ Возражения",
+        "📚 База знаний",
+        "🧭 Советник",
+    ])
+
+    with tab_trainer:
+        render_trainer_tab()
+    with tab_obj:
+        render_objections_tab()
+    with tab_kb:
+        render_kb_tab()
+    with tab_advisor:
+        render_advisor_tab()
 
 
 if __name__ == "__main__":
