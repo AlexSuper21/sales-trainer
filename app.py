@@ -977,6 +977,48 @@ def render_trainer_chat() -> None:
     with st.expander("🔍 Посмотреть текущий промпт клиента"):
         st.text(st.session_state.messages[0]["content"])
 
+    # --- Кнопки управления: ВЫШЕ истории, чтобы не оказались под полем ввода ---
+    col1, col2 = st.columns(2)
+    with col1:
+        eval_clicked = st.button(
+            "📊 Оценить диалог",
+            use_container_width=True,
+            disabled=len(st.session_state.messages) <= 3,
+        )
+    with col2:
+        if st.button("🔄 Начать заново", use_container_width=True):
+            for k in ["trainer_started", "messages", "config_key", "stage_index"]:
+                st.session_state.pop(k, None)
+            st.rerun()
+
+    if eval_clicked:
+        with st.spinner("Анализируем..."):
+            try:
+                evaluation = ask_client([
+                    {
+                        "role": "user",
+                        "content": build_eval_prompt(
+                            st.session_state.messages,
+                            f"{meta.get('situation','')} / "
+                            f"{meta.get('difficulty','')} / "
+                            f"{meta.get('psychotype','')} / "
+                            f"{meta.get('lpr','')} / "
+                            f"{STAGES[stage_index]['title']}",
+                        ),
+                    }
+                ])
+                st.subheader("Результат оценки")
+                st.text(evaluation)
+                save_trainer_log(
+                    {**meta, "stage": STAGES[stage_index]["title"]},
+                    st.session_state.messages,
+                    evaluation,
+                )
+                st.success("Диалог сохранён в logs.csv")
+            except Exception as e:
+                st.error(f"Не удалось оценить: {e}")
+
+    # --- История диалога ---
     for msg in st.session_state.messages[1:]:
         with st.chat_message(msg["role"]):
             if msg["role"] == "assistant":
@@ -984,6 +1026,7 @@ def render_trainer_chat() -> None:
             else:
                 st.write(msg["content"])
 
+    # --- Поле ввода: ВСЕГДА последнее ---
     if prompt := st.chat_input("Ваш ответ клиенту..."):
         with st.chat_message("user"):
             st.write(prompt)
@@ -994,94 +1037,58 @@ def render_trainer_chat() -> None:
             st.session_state.messages.append(
                 {"role": "assistant", "content": BLOCK_MESSAGE}
             )
-        else:
-            st.session_state.messages.append({"role": "user", "content": prompt})
-            with st.chat_message("assistant"):
-                with st.spinner("Клиент думает..."):
-                    try:
-                        answer = ask_client(st.session_state.messages)
-                    except Exception as e:
-                        answer = f"Ошибка: {e}"
-                thought, speech, stage_done = parse_thought_speech(answer)
-                if thought:
-                    st.markdown(
-                        f'<div class="thought">💭 {thought}</div>',
-                        unsafe_allow_html=True,
-                    )
-                st.markdown(speech)
-                if stage_done:
-                    st.success(f"✅ {stage_done}")
+            return
 
-            st.session_state.messages.append(
-                {"role": "assistant", "content": answer}
-            )
-
-            if stage_done:
-                new_idx = min(stage_index + 1, len(STAGES) - 1)
-                if new_idx != stage_index:
-                    st.session_state.stage_index = new_idx
-                    sit = next(
-                        (s for s in SITUATIONS if s["title"] == meta.get("situation")),
-                        SITUATIONS[0],
-                    )
-                    diff = next(
-                        (s for s in DIFFICULTIES if s["title"] == meta.get("difficulty")),
-                        DIFFICULTIES[0],
-                    )
-                    psych = next(
-                        (s for s in PSYCHOTYPES if s["title"] == meta.get("psychotype")),
-                        PSYCHOTYPES[0],
-                    )
-                    lpr = next(
-                        (s for s in LPR if s["title"] == meta.get("lpr")),
-                        LPR[0],
-                    )
-                    st.session_state.messages[0] = {
-                        "role": "system",
-                        "content": build_trainer_prompt(
-                            sit, diff, psych, lpr,
-                            STAGES[new_idx],
-                            st.session_state.lead,
-                        ),
-                    }
-                    st.rerun()
-
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("📊 Оценить диалог", use_container_width=True) \
-                and len(st.session_state.messages) > 3:
-            with st.spinner("Анализируем..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("assistant"):
+            with st.spinner("Клиент думает..."):
                 try:
-                    evaluation = ask_client([
-                        {
-                            "role": "user",
-                            "content": build_eval_prompt(
-                                st.session_state.messages,
-                                f"{meta.get('situation','')} / "
-                                f"{meta.get('difficulty','')} / "
-                                f"{meta.get('psychotype','')} / "
-                                f"{meta.get('lpr','')} / "
-                                f"{STAGES[stage_index]['title']}",
-                            ),
-                        }
-                    ])
-                    st.subheader("Результат оценки")
-                    st.text(evaluation)
-                    save_trainer_log(
-                        {**meta, "stage": STAGES[stage_index]["title"]},
-                        st.session_state.messages,
-                        evaluation,
-                    )
-                    st.success("Диалог сохранён в logs.csv")
+                    answer = ask_client(st.session_state.messages)
                 except Exception as e:
-                    st.error(f"Не удалось оценить: {e}")
+                    answer = f"Ошибка: {e}"
+            thought, speech, stage_done = parse_thought_speech(answer)
+            if thought:
+                st.markdown(
+                    f'<div class="thought">💭 {thought}</div>',
+                    unsafe_allow_html=True,
+                )
+            st.markdown(speech)
+            if stage_done:
+                st.success(f"✅ {stage_done}")
 
-    with col2:
-        if st.button("🔄 Начать заново", use_container_width=True):
-            for k in ["trainer_started", "messages", "config_key", "stage_index"]:
-                st.session_state.pop(k, None)
-            st.rerun()
+        st.session_state.messages.append(
+            {"role": "assistant", "content": answer}
+        )
 
+        if stage_done:
+            new_idx = min(stage_index + 1, len(STAGES) - 1)
+            if new_idx != stage_index:
+                st.session_state.stage_index = new_idx
+                sit = next(
+                    (s for s in SITUATIONS if s["title"] == meta.get("situation")),
+                    SITUATIONS[0],
+                )
+                diff = next(
+                    (s for s in DIFFICULTIES if s["title"] == meta.get("difficulty")),
+                    DIFFICULTIES[0],
+                )
+                psych = next(
+                    (s for s in PSYCHOTYPES if s["title"] == meta.get("psychotype")),
+                    PSYCHOTYPES[0],
+                )
+                lpr = next(
+                    (s for s in LPR if s["title"] == meta.get("lpr")),
+                    LPR[0],
+                )
+                st.session_state.messages[0] = {
+                    "role": "system",
+                    "content": build_trainer_prompt(
+                        sit, diff, psych, lpr,
+                        STAGES[new_idx],
+                        st.session_state.lead,
+                    ),
+                }
+                st.rerun()
 
 def render_trainer_tab() -> None:
     if not st.session_state.get("trainer_started"):
@@ -1122,8 +1129,9 @@ def render_objections_tab() -> None:
     if "objection_saved" not in st.session_state:
         st.session_state.objection_saved = []
 
+    # --- Кнопки управления: выше истории ---
     col1, col2 = st.columns([3, 1])
-    with col2:
+    with col1:
         if st.button("🎯 Новое возражение", use_container_width=True):
             history_text = "\n".join(
                 f"{m['role']}: {m['content']}"
@@ -1135,19 +1143,26 @@ def render_objections_tab() -> None:
                         sit, diff, psych, lpr, history_text
                     )
                     raw = ask_client([{"role": "user", "content": prompt}])
-                    objection = raw.strip()
                     st.session_state.objection_messages.append(
-                        {"role": "assistant", "content": objection}
+                        {"role": "assistant", "content": raw.strip()}
                     )
                 except Exception as e:
                     st.error(f"Ошибка: {e}")
             st.rerun()
-
-    with col1:
+    with col2:
         if st.button("🔄 Очистить", use_container_width=True):
             st.session_state.objection_messages = []
             st.rerun()
 
+    # --- Избранное: тоже выше поля ввода ---
+    if st.session_state.objection_saved:
+        with st.expander(
+            f"⭐ Избранные возражения ({len(st.session_state.objection_saved)})"
+        ):
+            for i, o in enumerate(st.session_state.objection_saved):
+                st.markdown(f"**{i + 1}.** {o['text']}")
+
+    # --- История ---
     for idx, msg in enumerate(st.session_state.objection_messages):
         with st.chat_message(msg["role"]):
             if msg["role"] == "assistant":
@@ -1177,6 +1192,7 @@ def render_objections_tab() -> None:
                     if msg.get("eval_comment"):
                         st.caption(msg["eval_comment"])
 
+    # --- Поле ввода: последнее ---
     if prompt := st.chat_input("Ваш ответ на возражение..."):
         with st.chat_message("user"):
             st.write(prompt)
@@ -1224,14 +1240,6 @@ def render_objections_tab() -> None:
                         )
                 except Exception as e:
                     st.error(f"Ошибка: {e}")
-
-    if st.session_state.objection_saved:
-        with st.expander(
-            f"⭐ Избранные возражения ({len(st.session_state.objection_saved)})"
-        ):
-            for i, o in enumerate(st.session_state.objection_saved):
-                st.markdown(f"**{i + 1}.** {o['text']}")
-
 
 # === БАЗА ЗНАНИЙ ===
 def render_kb_tab() -> None:
