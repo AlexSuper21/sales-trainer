@@ -639,10 +639,20 @@ def save_advisor_log(question: str, answer: str) -> None:
 
 
 # === COOKIE ===
-def get_cookie_manager():
+@st.cache_resource(show_spinner=False)
+def _get_cookie_manager_cached():
+    """CookieManager создаётся один раз на весь процесс.
+
+    Без @st.cache_resource Streamlit ругается на дубликат ключа,
+    потому что внутри CookieManager жёстко прописан свой key.
+    """
     if not COOKIE_AVAILABLE:
         return None
-    return stx.CookieManager(key="cookie_mgr")
+    return stx.CookieManager(key="cookie_mgr_v2")
+
+
+def get_cookie_manager():
+    return _get_cookie_manager_cached()
 
 
 def restore_session_from_cookie() -> None:
