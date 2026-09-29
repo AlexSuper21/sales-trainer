@@ -368,35 +368,77 @@ def ask_client(messages: list) -> str:
 
 
 # === ПАРСИНГ ===
-# Ищем ключи в любом месте строки — не только в начале
-_BLOCK_PATTERN = re.compile(
-    r'(THOUGHT|SPEECH|STAGE[_\s]?DONE|KB|NOTE|EVAL|COMMENT|QUESTION)'
-    r'\s*:\s*',
+
+# Кириллические «двойники» латинских букв — для нормализации ключей
+_CYR_TO_LAT = str.maketrans({
+    'А': 'A', 'В': 'B', 'Е': 'E', 'К': 'K', 'М': 'M', 'Н': 'H',
+    'О': 'O', 'Р': 'P', 'С': 'C', 'Т': 'T', 'У': 'Y', 'Х': 'X',
+    'а': 'a', 'в': 'b', 'е': 'e', 'к': 'k', 'м': 'm', 'н': 'h',
+    'о': 'o', 'р': 'p', 'с': 'c', 'т': 't', 'у': 'y', 'х': 'x',
+})
+
+_KNOWN_KEYS = {
+    "THOUGHT", "SPEECH", "STAGE_DONE", "KB", "NOTE",
+    "EVAL", "COMMENT", "QUESTION",
+}
+
+# Любое слово из 2–20 букв (латиница + кириллица) с двоеточием —
+# потенциальный ключ. Отбираем потом по нормализованному имени.
+_CANDIDATE_KEY_RE = re.compile(
+    r'(?<![\w])([A-Za-zА-Яа-яЁё_]{2,20})\s*:\s*'
+)
+
+# Скобочные осколки вида [THOUGHT], [/SPEECH]
+_TAG_RE = re.compile(r'\[\s*/?\s*[A-ZА-ЯЁ_]{3,}\s*\]')
+
+# Одиночные ключи-метки, которые могли не отфильтроваться
+_STRAY_KEY_RE = re.compile(
+    r'(?<![\w])(THOUGHT|SPEECH|SPEЧ|SPECH|STAGE[_\s]?DONE|'
+    r'KB|NOTE|EVAL|COMMENT|QUESTION)\s*:\s*',
     re.IGNORECASE,
 )
 
-_TAG_RE = re.compile(r'\[\s*/?\s*[A-ZА-ЯЁ_]{3,}\s*\]')
+
+def _normalize_key(raw: str) -> str:
+    """Приводит ключ к каноническому виду. Чинит кириллицу и опечатки."""
+    key = raw.strip().upper().replace(" ", "_")
+    key = key.translate(_CYR_TO_LAT)
+    key = key.replace("Ч", "CH")
+    if key.startswith("THOU"):
+        return "THOUGHT"
+    if key.startswith("SPE"):
+        return "SPEECH"
+    if "STAGE" in key and "DON" in key:
+        return "STAGE_DONE"
+    if key in ("KB", "NOTE", "EVAL", "COMMENT", "QUESTION"):
+        return key
+    return key
 
 
 def _clean_tag_remnants(text: str) -> str:
-    return _TAG_RE.sub('', text).strip()
+    """Убирает любые осколки тегов и ключей."""
+    text = _TAG_RE.sub('', text)
+    text = _STRAY_KEY_RE.sub('', text)
+    return text.strip()
 
 
 def _parse_blocks(text: str) -> dict:
-    """Режет текст по ключам KEY: где бы они ни стояли — в начале строки
-    или посреди неё. Значение тянется до следующего ключа.
-    """
+    """Парсит блоки 'KEY: value'. Ключ ищется в любом месте текста,
+    включая случаи с кириллическими подменами (SPEЧ → SPEECH)."""
     result = {}
-    matches = list(_BLOCK_PATTERN.finditer(text))
+    matches = []
+    for m in _CANDIDATE_KEY_RE.finditer(text):
+        normalized = _normalize_key(m.group(1))
+        if normalized in _KNOWN_KEYS:
+            matches.append((m.start(), m.end(), normalized))
+
     if not matches:
         return result
-    for i, m in enumerate(matches):
-        key = m.group(1).upper().replace(" ", "_")
-        if key == "STAGE_DONE":
-            key = "STAGE_DONE"
-        start = m.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-        value = text[start:end].strip()
+
+    for i, (start, end, key) in enumerate(matches):
+        val_start = end
+        val_end = matches[i + 1][0] if i + 1 < len(matches) else len(text)
+        value = text[val_start:val_end].strip()
         if key in result:
             result[key] = (result[key] + "\n" + value).strip()
         else:
@@ -417,10 +459,16 @@ def parse_thought_speech(text: str):
         thought = blocks.get("THOUGHT")
         if _is_none_value(thought):
             thought = None
+        # Защита: если в thought просочился кусок речи, обрезаем
+        if thought:
+            cut = re.split(
+                r'\bSPE[EЕ]*CH?\b|\bSPE[EЕ]*C\b',
+                thought, maxsplit=1, flags=re.IGNORECASE,
+            )
+            thought = cut[0].strip() or None
+
         speech = blocks.get("SPEECH") or _clean_tag_remnants(text)
-        # На случай если модель запихала в thought кусок speech
-        if thought and "SPEECH" in thought.upper():
-            thought = None
+
         stage_done = blocks.get("STAGE_DONE")
         if _is_none_value(stage_done):
             stage_done = None
@@ -491,7 +539,9 @@ def build_trainer_prompt(situation, difficulty, psychotype, lpr, stage, lead) ->
 {knowledge}
 
 ФОРМАТ ОТВЕТА — три блока. Каждый блок начинается С НОВОЙ СТРОКИ
-со своей метки, метка пишется латиницей, двоеточие обязательно:
+со своей метки. Метка пишется ЛАТИНСКИМИ буквами, двоеточие обязательно.
+ВНИМАНИЕ: не подменяй латинские буквы похожими кириллическими!
+Правильно: THOUGHT, SPEECH, STAGE_DONE. Неправильно: SPECH, SPEЧ, SPEEСН.
 
 THOUGHT: <мысли или жест ОДНОЙ короткой фразой. Заполняй ТОЛЬКО
          когда внутри тебя есть заметная эмоция: сомнение, раздражение,
@@ -778,7 +828,13 @@ def render_stage_bar(stage_index: int) -> None:
 
 
 def render_assistant_message(content: str) -> None:
+    """Рендер реплики клиента с мыслью/жестом."""
     thought, speech, _ = parse_thought_speech(content)
+
+    # Дополнительный предохранитель: если в speech остались осколки
+    # меток — вычистим их и в нём
+    speech = _clean_tag_remnants(speech) or speech
+
     if thought:
         st.markdown(
             f'<div class="thought">💭 {thought}</div>',
@@ -1093,7 +1149,6 @@ def render_trainer_chat() -> None:
 def render_trainer_tab() -> None:
     if not st.session_state.get("trainer_started"):
         render_trainer_setup()
-        # пока настройка не начата — chat_input не показываем
         return
     render_trainer_chat()
 
@@ -1370,8 +1425,6 @@ def main() -> None:
             "requirements.txt библиотеку `extra-streamlit-components`."
         )
 
-    # Навигация вместо st.tabs — чтобы chat_input был последним в main
-    # и Streamlit прибил его к низу окна
     if "active_tab" not in st.session_state:
         st.session_state.active_tab = TAB_TRAINER
 
